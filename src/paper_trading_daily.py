@@ -19,6 +19,7 @@ from csi_fundamental_improvement_analysis import (
     select_diversified_weights,
 )
 from csi_fundamental_regime_exposure import target_exposure
+from csi_fundamental_recency_weighted_validation import fit_weighted_model, recency_schemes
 from csi_fundamental_true_sharpe_validation import exposure_candidates
 from csi_fundamental_walkforward import load_cached_features
 from csi_medium_term_strategy import metrics
@@ -39,6 +40,10 @@ def load_config(path: Path) -> dict:
         "embargo": 40,
         "score_mode": "sharpe",
         "vol_budgets": "0.18,0.20,0.22,0.24,0.26,0.28,0.30",
+        "recency_schemes": "full_equal,exp_hl_126,exp_hl_252,exp_hl_504,rolling_504",
+        "model_ids": "1,3,4",
+        "trade_rule_ids": "401,402,403",
+        "exposure_names": "vol_0.18,vol_0.26,vol_0.30,trend_vol_0.18,trend_vol_0.26,trend_breadth_keep",
         "min_price": 2,
         "max_price_for_new_buy": 300,
         "min_order_value": 1000,
@@ -86,35 +91,56 @@ def validation_backtest(predicted: pd.DataFrame, trade_rule, exposure_rule) -> p
 def choose_candidate(train: pd.DataFrame, val: pd.DataFrame, features: pd.DataFrame, config: dict) -> tuple[dict, pd.DataFrame]:
     vol_budgets = [float(item) for item in str(config["vol_budgets"]).split(",")]
     exp_rules = exposure_candidates(vol_budgets)
+    if config.get("exposure_names"):
+        exposure_names = {item.strip() for item in str(config["exposure_names"]).split(",") if item.strip()}
+        exp_rules = [rule for rule in exp_rules if rule.name in exposure_names]
+    schemes = recency_schemes()
+    if config.get("recency_schemes"):
+        scheme_names = {item.strip() for item in str(config["recency_schemes"]).split(",") if item.strip()}
+        schemes = [scheme for scheme in schemes if scheme.name in scheme_names]
+    model_ids = {int(item) for item in str(config.get("model_ids", "")).split(",") if item.strip()}
+    trade_rule_ids = {int(item) for item in str(config.get("trade_rule_ids", "")).split(",") if item.strip()}
+    specs = model_specs(features)
+    if model_ids:
+        specs = [spec for spec in specs if spec.model_id in model_ids]
+    trade_rules = diversified_rules(constrained_only=True)
+    if trade_rule_ids:
+        trade_rules = [rule for rule in trade_rules if rule.rule_id in trade_rule_ids]
     rows = []
     best = None
-    for spec in model_specs(features):
-        cols = columns_for_spec(features, spec)
-        model = fit_model(train, spec, cols)
-        val_pred = predict_frame(model, val, cols)
-        for trade_rule in diversified_rules(constrained_only=True):
-            for exp_rule in exp_rules:
-                bt = validation_backtest(val_pred, trade_rule, exp_rule)
-                m = metrics(bt)
-                score = regime_score(m, str(config["score_mode"]))
-                row = {
-                    "model_id": spec.model_id,
-                    "feature_set": spec.feature_set,
-                    "trade_rule_id": trade_rule.rule_id,
-                    "exposure_name": exp_rule.name,
-                    "target_vol": exp_rule.target_vol,
-                    "score": score,
-                    **{f"validation_{key}": value for key, value in m.items()},
-                }
-                rows.append(row)
-                if best is None or score > best["score"]:
-                    best = {
-                        **row,
-                        "model": spec,
-                        "cols": cols,
-                        "trade_rule": trade_rule,
-                        "exposure_rule": exp_rule,
+    for scheme in schemes:
+        for spec in specs:
+            cols = columns_for_spec(features, spec)
+            model = fit_weighted_model(train, spec, cols, scheme)
+            if model is None:
+                continue
+            val_pred = predict_frame(model, val, cols)
+            for trade_rule in trade_rules:
+                for exp_rule in exp_rules:
+                    bt = validation_backtest(val_pred, trade_rule, exp_rule)
+                    m = metrics(bt)
+                    score = regime_score(m, str(config["score_mode"]))
+                    row = {
+                        "scheme_id": scheme.scheme_id,
+                        "scheme_name": scheme.name,
+                        "model_id": spec.model_id,
+                        "feature_set": spec.feature_set,
+                        "trade_rule_id": trade_rule.rule_id,
+                        "exposure_name": exp_rule.name,
+                        "target_vol": exp_rule.target_vol,
+                        "score": score,
+                        **{f"validation_{key}": value for key, value in m.items()},
                     }
+                    rows.append(row)
+                    if best is None or score > best["score"]:
+                        best = {
+                            **row,
+                            "scheme": scheme,
+                            "model": spec,
+                            "cols": cols,
+                            "trade_rule": trade_rule,
+                            "exposure_rule": exp_rule,
+                        }
     return best, pd.DataFrame(rows).sort_values("score", ascending=False)
 
 
@@ -213,7 +239,9 @@ def run(args: argparse.Namespace) -> None:
     best, candidates = choose_candidate(train, val, features, config)
 
     train_full = features[features["date"] <= val_dates[-1]].copy()
-    model = fit_model(train_full, best["model"], best["cols"])
+    model = fit_weighted_model(train_full, best["model"], best["cols"], best["scheme"])
+    if model is None:
+        raise RuntimeError(f"Could not fit selected recency scheme: {best['scheme'].name}")
     live_pred = predict_frame(model, live_day, best["cols"])
     # The selector only requires this column for schema compatibility; live signal generation must not inspect it.
     live_pred["fwd_return_1"] = 0.0
@@ -243,6 +271,7 @@ def run(args: argparse.Namespace) -> None:
         "validation": f"{val_dates[0].date()} to {val_dates[-1].date()} ({len(val_dates)} dates)",
         "selected": {
             "model": asdict(best["model"]),
+            "recency_scheme": asdict(best["scheme"]),
             "feature_count": len(best["cols"]),
             "trade_rule": asdict(best["trade_rule"]),
             "exposure_rule": asdict(best["exposure_rule"]),
