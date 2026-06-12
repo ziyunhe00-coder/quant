@@ -1,0 +1,18 @@
+{
+  "max_symbols": 200,
+  "capital": 100000,
+  "lot_size": 100,
+  "industry_map": "data/processed/csi1000_industry_map_200.csv",
+  "industry_col": "industry_gate",
+  "output_dir": "paper_trading",
+  "positions_path": "paper_trading/positions.csv",
+  "train_min": 760,
+  "val_len": 194,
+  "embargo": 40,
+  "score_mode": "sharpe",
+  "vol_budgets": "0.18,0.20,0.22,0.24,0.26,0.28,0.30",
+  "min_price": 2,
+  "max_price_for_new_buy": 300,
+  "min_order_value": 1000,
+  "send_empty_orders": false
+}
